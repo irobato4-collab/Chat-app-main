@@ -14,60 +14,83 @@ const recentRoomsEl = document.getElementById("recentRooms");
 const logoutBtn = document.getElementById("logoutBtn");
 
 const KEY_RECENT = "chat_recent_rooms";
+const KEY_UID = "chat_user_id";
 
 let selectedRoom = null;
+let roomsCache = [];
+
+let userId = localStorage.getItem(KEY_UID);
+if (!userId) {
+  userId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2));
+  localStorage.setItem(KEY_UID, userId);
+}
 
 function safeRoomName(name){
   return /^[a-zA-Z0-9_-]{1,40}$/.test(name);
 }
 
 function getRecent(){
-  try {
-    return JSON.parse(localStorage.getItem(KEY_RECENT) || "[]");
-  } catch {
-    return [];
-  }
+  try { return JSON.parse(localStorage.getItem(KEY_RECENT) || "[]"); }
+  catch { return []; }
 }
+
+function setRecent(list){
+  localStorage.setItem(KEY_RECENT, JSON.stringify(list.slice(0, 20)));
+}
+
 function addRecent(room){
   const list = getRecent().filter(r => r !== room);
   list.unshift(room);
-  localStorage.setItem(KEY_RECENT, JSON.stringify(list.slice(0, 20)));
-  renderRecent();
+  setRecent(list);
 }
+
+function roomExists(room){
+  return roomsCache.includes(room);
+}
+
 function renderRecent(){
   const list = getRecent();
-  if (!list.length) {
+  const filtered = list.filter(r => roomExists(r));
+
+  if (!filtered.length) {
     recentRoomsEl.textContent = "なし";
-    return;
+  } else {
+    recentRoomsEl.innerHTML = "";
+    filtered.forEach(r => {
+      const btn = document.createElement("button");
+      btn.className = "room-btn";
+      btn.textContent = r;
+      btn.onclick = () => openJoin(r);
+      recentRoomsEl.appendChild(btn);
+    });
   }
-  recentRoomsEl.innerHTML = "";
-  list.forEach(r => {
-    const btn = document.createElement("button");
-    btn.className = "room-btn";
-    btn.textContent = r;
-    btn.onclick = () => openJoin(r);
-    recentRoomsEl.appendChild(btn);
-  });
+
+  // 消えた部屋は永続リストから掃除
+  if (filtered.length !== list.length) setRecent(filtered);
 }
 
 async function loadRooms(){
   roomsListEl.textContent = "読み込み中…";
   const res = await fetch("/rooms");
   const data = await res.json();
-  const rooms = (data.rooms || []).sort((a,b)=>a.localeCompare(b, "ja"));
+  roomsCache = (data.rooms || []).slice();
 
+  const rooms = roomsCache.slice().sort((a,b)=>a.localeCompare(b, "ja"));
   roomsListEl.innerHTML = "";
+
   if (!rooms.length){
     roomsListEl.textContent = "部屋がありません（作成してください）";
-    return;
+  } else {
+    rooms.forEach(r => {
+      const btn = document.createElement("button");
+      btn.className = "room-btn";
+      btn.textContent = r;
+      btn.onclick = () => openJoin(r);
+      roomsListEl.appendChild(btn);
+    });
   }
-  rooms.forEach(r => {
-    const btn = document.createElement("button");
-    btn.className = "room-btn";
-    btn.textContent = r;
-    btn.onclick = () => openJoin(r);
-    roomsListEl.appendChild(btn);
-  });
+
+  renderRecent(); // ★一覧取得後にrecent描画
 }
 
 function openJoin(room){
@@ -86,15 +109,22 @@ joinRoomBtn.addEventListener("click", async () => {
   const res = await fetch("/rooms/join", {
     method:"POST",
     headers:{ "Content-Type":"application/json" },
-    body: JSON.stringify({ room: selectedRoom, password: pass })
+    body: JSON.stringify({ room: selectedRoom, password: pass, userId })
   });
+
   const data = await res.json();
+
   if (data.ok){
-    addRecent(selectedRoom);
-    // 入室
-    location.href = `/index.html?room=${encodeURIComponent(selectedRoom)}`;
+    // ★存在する部屋だけrecentへ
+    if (roomExists(selectedRoom)) addRecent(selectedRoom);
+
+    // ★tokenは保存しない（毎回パス必須運用）
+    // URLに付けて index へ
+    location.href = `/index.html?room=${encodeURIComponent(selectedRoom)}&t=${encodeURIComponent(data.token)}`;
+  } else if (data.error === "wrong_password") {
+    joinMsg.textContent = "パスワードが違います";
   } else {
-    joinMsg.textContent = "パスワードが違うか、部屋がありません";
+    joinMsg.textContent = "部屋がありません";
   }
 });
 
@@ -116,10 +146,9 @@ createRoomBtn.addEventListener("click", async () => {
   const data = await res.json();
 
   if (data.ok){
-    createMsg.textContent = "作成しました。入室できます。";
+    createMsg.textContent = "作成しました。参加してください。";
     await loadRooms();
     openJoin(room);
-    joinRoomPass.value = pass; // そのまま入れるように
   } else if (data.error === "exists"){
     createMsg.textContent = "同じ部屋名が既にあります";
   } else if (data.error === "bad_room_name"){
@@ -134,5 +163,4 @@ logoutBtn.addEventListener("click", () => {
   location.replace("/password.html");
 });
 
-renderRecent();
 loadRooms();
