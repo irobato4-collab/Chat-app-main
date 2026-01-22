@@ -1,11 +1,18 @@
+// client.js
 const socket = io();
 
-// room (from query)
+// room/token (from query)
 const params = new URLSearchParams(location.search);
 const room = params.get("room");
+const token = params.get("t");
 
-// room必須：無ければ部屋一覧へ
+// room 必須
 if (!room) {
+  location.replace("/rooms.html");
+}
+
+// ★毎回パス必須：token 無いなら入れない（直URL対策）
+if (!token) {
   location.replace("/rooms.html");
 }
 
@@ -32,7 +39,7 @@ const KEY_COLOR = "chat_color";
 const KEY_AVATAR = "chat_avatar";
 const KEY_UID = "chat_user_id";
 
-// 永続 userId（これが“削除権限”の本体）
+// 永続 userId（削除権限の本体）
 let userId = localStorage.getItem(KEY_UID);
 if (!userId) {
   userId = (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2));
@@ -52,7 +59,7 @@ if (backToRoomsBtn) {
   });
 }
 
-// 初回表示
+// 初回表示（既にあれば隠す）
 function showSetupIfNeeded() {
   if (username && color) {
     setupPanel.style.display = "none";
@@ -65,7 +72,7 @@ function showSetupIfNeeded() {
 }
 showSetupIfNeeded();
 
-// avatar ファイルを base64
+// avatar ファイルを base64 に
 avatarInput.addEventListener("change", async (e) => {
   const file = e.target.files[0];
   if (!file) return;
@@ -74,7 +81,7 @@ avatarInput.addEventListener("change", async (e) => {
   reader.readAsDataURL(file);
 });
 
-// 保存
+// 保存ボタン
 saveSettingsBtn.addEventListener("click", () => {
   const name = usernameInput.value.trim();
   const col = colorInput.value;
@@ -100,8 +107,11 @@ saveSettingsBtn.addEventListener("click", () => {
 
 // キャンセル
 cancelSetupBtn.addEventListener("click", () => {
-  if (username && color) setupPanel.style.display = "none";
-  else alert("名前を入力してから開始してください");
+  if (username && color) {
+    setupPanel.style.display = "none";
+  } else {
+    alert("名前を入力してから開始してください");
+  }
 });
 
 // 設定を開く
@@ -125,12 +135,9 @@ function escapeHtml(s){
 
 // メッセージ要素
 function makeMessageEl(msg) {
-  // msg: { id, userId, name, color, text, avatar }
   const isOwner = (msg.userId === userId);
-  const isSelf = isOwner;
-
   const li = document.createElement("li");
-  li.className = "message " + (isSelf ? "right" : "left");
+  li.className = "message " + (isOwner ? "right" : "left");
   li.dataset.id = msg.id;
 
   let iconHtml = "";
@@ -164,7 +171,7 @@ function makeMessageEl(msg) {
     const delBtn = li.querySelector(".delete");
     if (delBtn) {
       delBtn.addEventListener("click", () => {
-        socket.emit("requestDelete", { room, id: msg.id, userId });
+        socket.emit("requestDelete", { room, id: msg.id, userId, token });
       });
     }
     const openBtn = li.querySelector(".open-menu");
@@ -181,18 +188,13 @@ function makeMessageEl(msg) {
   return li;
 }
 
-// ルーム参加して履歴要求
-socket.emit("joinRoom", { room });
+// ★ルーム参加（token必須）
+socket.emit("joinRoom", { room, userId, token });
 
-// 履歴受信（room付き）
-socket.on("history", ({ room: r, msgs }) => {
-  if (r !== room) return;
-  messagesEl.innerHTML = "";
-  (msgs || []).forEach(m => {
-    const el = makeMessageEl(m);
-    messagesEl.appendChild(el);
-  });
-  messagesEl.scrollTop = messagesEl.scrollHeight;
+// 認可失敗はroomsへ
+socket.on("roomAuthFailed", () => {
+  alert("部屋に入るにはパスワード認証が必要です（roomsから入ってください）");
+  location.replace("/rooms.html");
 });
 
 socket.on("roomNotFound", () => {
@@ -200,10 +202,19 @@ socket.on("roomNotFound", () => {
   location.replace("/rooms.html");
 });
 
+// 履歴受信
+socket.on("history", ({ room: r, msgs }) => {
+  if (r !== room) return;
+  messagesEl.innerHTML = "";
+  (msgs || []).forEach(m => {
+    messagesEl.appendChild(makeMessageEl(m));
+  });
+  messagesEl.scrollTop = messagesEl.scrollHeight;
+});
+
 // 新着
 socket.on("chat message", (m) => {
-  const el = makeMessageEl(m);
-  messagesEl.appendChild(el);
+  messagesEl.appendChild(makeMessageEl(m));
   messagesEl.scrollTop = messagesEl.scrollHeight;
 });
 
@@ -234,6 +245,7 @@ socket.on("delete message", (id) => {
 
 socket.on("deleteFailed", ({ reason }) => {
   if (reason === "not_owner") alert("他人のメッセージは削除できません");
+  else if (reason === "no_access") alert("認証が必要です（roomsから入り直してください）");
   else alert("削除に失敗しました");
 });
 
@@ -258,18 +270,19 @@ function sendMessage() {
 
   const msg = {
     id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2),
-    userId,                 // ★これが所有者キー
+    userId,
     name: username,
     color: color,
     avatar: avatar || null,
     text
   };
 
-  socket.emit("chat message", { room, msg });
+  // ★token必須（毎回パス必須運用に合わせる）
+  socket.emit("chat message", { room, msg, userId, token });
   inputEl.value = "";
 }
 
-// 念のためjoin送る
+// 念のため join 情報
 if (username) {
   if (!avatar) avatar = localStorage.getItem(KEY_AVATAR) || null;
   socket.emit("userJoin", { userId, name: username, color, avatar });
@@ -281,7 +294,8 @@ if (adminClearBtn) {
   adminClearBtn.addEventListener("click", () => {
     const password = prompt("管理者パスワードを入力してください");
     if (!password) return;
-    socket.emit("adminClearAll", { room, password });
+
+    socket.emit("adminClearAll", { room, password, userId, token });
   });
 }
 
