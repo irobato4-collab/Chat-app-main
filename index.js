@@ -1,178 +1,172 @@
-const express = require("express");
-const http = require("http");
-const { Server } = require("socket.io");
-const session = require("express-session");
-const fs = require("fs");
-const path = require("path");
+// index.js
+import express from "express";
+import http from "http";
+import { Server } from "socket.io";
+import crypto from "crypto";
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-/* =========================
-   基本設定
-========================= */
-app.use(express.json());
+/* ===== 設定 ===== */
+const MAX_MESSAGES = 100;
+const ROOM_DIR = "rooms";
+
+const {
+  GITHUB_TOKEN,
+  GITHUB_OWNER,
+  GITHUB_REPO,
+  GITHUB_BRANCH,
+  SECRET_KEY,
+  ADMIN_PASSWORD,
+  ENTRY_PASSWORD,
+  PORT
+} = process.env;
+
 app.use(express.static("public"));
+app.use(express.json());
 
-/* =========================
-   セッション設定（最重要）
-========================= */
-const sessionMiddleware = session({
-  secret: "super-room-secret",
-  resave: false,
-  saveUninitialized: false
-});
+let users = {};
 
-app.use(sessionMiddleware);
-io.engine.use(sessionMiddleware);
+/* ===== 暗号化 ===== */
+const ALGO = "aes-256-gcm";
+const KEY = crypto.createHash("sha256").update(SECRET_KEY).digest();
 
-/* =========================
-   util
-========================= */
-function roomFile(room) {
-  return path.join(__dirname, `${room}.env.json`);
+function encrypt(text) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
+  const enc = Buffer.concat([cipher.update(text, "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, enc]).toString("base64");
 }
 
-function roomExists(room) {
-  return fs.existsSync(roomFile(room));
+function decrypt(enc) {
+  const buf = Buffer.from(enc, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }
 
-/* =========================
-   部屋作成API
-========================= */
-app.post("/room-create", (req, res) => {
-  const { room, password } = req.body;
+/* ===== GitHub ===== */
+const GH_HEADERS = {
+  Authorization: `Bearer ${GITHUB_TOKEN}`,
+  "Content-Type": "application/json",
+  "User-Agent": "chat-app"
+};
 
-  if (!room || !password) {
-    return res.json({ ok: false, reason: "invalid" });
-  }
+const roomFilePath = r => `${ROOM_DIR}/${r}.env.json`;
+const roomUrl = r =>
+  `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(roomFilePath(r))}?ref=${GITHUB_BRANCH}`;
 
-  if (roomExists(room)) {
-    return res.json({ ok: false, reason: "exists" });
-  }
+async function loadRoomData(room) {
+  const res = await fetch(roomUrl(room), { headers: GH_HEADERS });
+  if (res.status === 404) return null;
+  const json = await res.json();
+  const decrypted = decrypt(Buffer.from(json.content, "base64").toString());
+  return { data: JSON.parse(decrypted), sha: json.sha };
+}
 
-  const data = {
-    password,
-    messages: []
-  };
+async function saveRoomData(room, data, sha) {
+  const encrypted = encrypt(JSON.stringify(data));
+  const content = Buffer.from(encrypted).toString("base64");
+  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(roomFilePath(room))}`;
+  await fetch(url, {
+    method: "PUT",
+    headers: GH_HEADERS,
+    body: JSON.stringify({
+      message: "update room",
+      content,
+      branch: GITHUB_BRANCH,
+      ...(sha ? { sha } : {})
+    })
+  });
+}
 
-  fs.writeFileSync(roomFile(room), JSON.stringify(data, null, 2));
-  res.json({ ok: true });
+const safeRoomName = n => /^[a-zA-Z0-9_-]{1,40}$/.test(n);
+const hashRoomPassword = p => crypto.createHash("sha256").update(String(p)).digest("hex");
+
+/* ===== トークン（join 専用） ===== */
+const USED_TOKENS = new Set();
+
+function makeRoomToken(room, userId) {
+  const payload = Buffer.from(JSON.stringify({ room, userId, ts: Date.now() })).toString("base64url");
+  const sig = crypto.createHmac("sha256", SECRET_KEY).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifyRoomToken(token, room, userId) {
+  if (USED_TOKENS.has(token)) return false;
+  const [p, s] = token.split(".");
+  const exp = crypto.createHmac("sha256", SECRET_KEY).update(p).digest("base64url");
+  if (s !== exp) return false;
+  const data = JSON.parse(Buffer.from(p, "base64url").toString());
+  return data.room === room && data.userId === userId;
+}
+
+/* ===== HTTP ===== */
+app.post("/auth", (req, res) => {
+  res.json({ ok: req.body.password === ENTRY_PASSWORD });
 });
 
-/* =========================
-   部屋入室認証API
-========================= */
-app.post("/room-auth", (req, res) => {
-  const { room, password } = req.body;
+app.post("/rooms/join", async (req, res) => {
+  const { room, password, userId } = req.body;
+  const loaded = await loadRoomData(room);
+  if (!loaded) return res.json({ ok: false });
 
-  if (!roomExists(room)) {
-    return res.json({ ok: false, reason: "notfound" });
-  }
+  if (loaded.data.passHash !== hashRoomPassword(password))
+    return res.json({ ok: false });
 
-  const data = JSON.parse(fs.readFileSync(roomFile(room), "utf8"));
-
-  if (data.password !== password) {
-    return res.json({ ok: false, reason: "wrong" });
-  }
-
-  // セッションに部屋認証を保存
-  if (!req.session.rooms) req.session.rooms = {};
-  req.session.rooms[room] = true;
-
-  res.json({ ok: true });
+  res.json({ ok: true, token: makeRoomToken(room, userId) });
 });
 
-/* =========================
-   Socket.io
-========================= */
+/* ===== socket.io ===== */
 io.on("connection", socket => {
-  const session = socket.request.session;
-
-  /* ----- 部屋参加 ----- */
-  socket.on("joinRoom", room => {
-    if (!session?.rooms?.[room]) {
-      socket.emit("roomAuthRequired");
+  socket.on("joinRoom", async ({ room, userId, token }) => {
+    if (!verifyRoomToken(token, room, userId)) {
+      socket.emit("roomAuthFailed");
       return;
     }
 
+    USED_TOKENS.add(token); // ★ join時のみ消費
     socket.join(room);
-    socket.currentRoom = room;
+    socket.data.room = room;
+    socket.data.userId = userId;
 
-    // 履歴送信
-    const data = JSON.parse(fs.readFileSync(roomFile(room), "utf8"));
-    socket.emit("history", data.messages);
+    const loaded = await loadRoomData(room);
+    socket.emit("history", { room, msgs: loaded?.data.messages || [] });
   });
 
-  /* ----- メッセージ受信 ----- */
-  socket.on("chat message", msg => {
-    const room = socket.currentRoom;
-
-    if (!room || !session?.rooms?.[room]) {
-      socket.emit("roomAuthRequired");
+  socket.on("chat message", async ({ room, msg }) => {
+    if (socket.data.room !== room) {
+      socket.emit("roomAuthFailed");
       return;
     }
 
-    const file = roomFile(room);
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
+    const loaded = await loadRoomData(room);
+    loaded.data.messages.push(msg);
+    loaded.data.messages = loaded.data.messages.slice(-MAX_MESSAGES);
 
-    data.messages.push(msg);
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-
+    await saveRoomData(room, loaded.data, loaded.sha);
     io.to(room).emit("chat message", msg);
   });
 
-  /* ----- メッセージ削除（本人のみ） ----- */
-  socket.on("requestDelete", id => {
-    const room = socket.currentRoom;
+  socket.on("requestDelete", async ({ room, id }) => {
+    if (socket.data.room !== room) return;
 
-    if (!room || !session?.rooms?.[room]) {
-      socket.emit("deleteFailed", { id, reason: "auth" });
-      return;
-    }
+    const loaded = await loadRoomData(room);
+    const msg = loaded.data.messages.find(m => m.id === id);
+    if (!msg || msg.userId !== socket.data.userId) return;
 
-    const file = roomFile(room);
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-
-    const before = data.messages.length;
-    data.messages = data.messages.filter(m => m.id !== id);
-
-    if (data.messages.length === before) {
-      socket.emit("deleteFailed", { id, reason: "notfound" });
-      return;
-    }
-
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
+    loaded.data.messages = loaded.data.messages.filter(m => m.id !== id);
+    await saveRoomData(room, loaded.data, loaded.sha);
     io.to(room).emit("delete message", id);
-  });
-
-  /* ----- 管理者：全削除 ----- */
-  socket.on("adminClearAll", password => {
-    const room = socket.currentRoom;
-
-    if (!room || !session?.rooms?.[room]) {
-      socket.emit("adminClearFailed", "auth");
-      return;
-    }
-
-    const file = roomFile(room);
-    const data = JSON.parse(fs.readFileSync(file, "utf8"));
-
-    if (data.password !== password) {
-      socket.emit("adminClearFailed", "wrong password");
-      return;
-    }
-
-    data.messages = [];
-    fs.writeFileSync(file, JSON.stringify(data, null, 2));
-    io.to(room).emit("clearAllMessages");
   });
 });
 
-/* =========================
-   起動
-========================= */
-server.listen(3000, () => {
-  console.log("Server running http://localhost:3000");
+/* ===== 起動 ===== */
+server.listen(PORT || 3000, () => {
+  console.log("Server running");
 });
