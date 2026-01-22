@@ -10,7 +10,7 @@ const io = new Server(server);
 
 /* ===== 設定 ===== */
 const MAX_MESSAGES = 100;
-const ROOM_DIR = "rooms"; // GitHub上の保存先フォルダ（contents API で扱える）
+const ROOM_DIR = "rooms";
 
 // env
 const {
@@ -59,7 +59,6 @@ const GH_HEADERS = {
 };
 
 function roomFilePath(room) {
-  // 例: rooms/myroom.env.json
   return `${ROOM_DIR}/${room}.env.json`;
 }
 
@@ -69,8 +68,7 @@ function roomUrl(room) {
 }
 
 async function ghGet(url) {
-  const res = await fetch(url, { headers: GH_HEADERS });
-  return res;
+  return await fetch(url, { headers: GH_HEADERS });
 }
 
 async function ghPut(filePath, contentBase64, sha) {
@@ -81,24 +79,18 @@ async function ghPut(filePath, contentBase64, sha) {
     branch: GITHUB_BRANCH,
     ...(sha ? { sha } : {})
   };
-  const res = await fetch(url, {
+  return await fetch(url, {
     method: "PUT",
     headers: GH_HEADERS,
     body: JSON.stringify(body)
   });
-  return res;
 }
 
 function safeRoomName(name) {
-  // GitHubパスに使うので最低限の制限
-  // 日本語はOKにしたい場合もあるが、まずは英数-_ のみ推奨（安全）
-  // 必要なら緩められる
   return /^[a-zA-Z0-9_-]{1,40}$/.test(name);
 }
 
 function hashRoomPassword(roomPassword) {
-  // SECRET_KEYが漏れない前提で、roomPassword をハッシュ化して保存
-  // ただし本気の強度が欲しいならPBKDF2/bcryptにしたい（後で差し替え可）
   return crypto.createHash("sha256").update(String(roomPassword)).digest("hex");
 }
 
@@ -125,18 +117,70 @@ async function saveRoomData(room, data, sha) {
   }
 }
 
+/* ===== 使い捨て入室トークン =====
+   - /rooms/join 成功で token 発行
+   - socket joinRoom 時に token 検証 + 1回使ったら失効
+   => URL直打ち／共有をかなり抑止
+*/
+const USED_TOKENS = new Set();
+
+function makeRoomToken(room, userId) {
+  const ts = Date.now();
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const payload = JSON.stringify({ room, userId, ts, nonce });
+  const payloadB64 = Buffer.from(payload).toString("base64url");
+  const sig = crypto.createHmac("sha256", SECRET_KEY).update(payloadB64).digest("base64url");
+  return `${payloadB64}.${sig}`;
+}
+
+function verifyRoomToken(token, room, userId, maxAgeMs = 1000 * 60 * 10) {
+  // 10分有効（短め：毎回パス必須運用に向く）
+  if (!token || typeof token !== "string") return { ok: false, reason: "missing" };
+  if (USED_TOKENS.has(token)) return { ok: false, reason: "used" };
+
+  const parts = token.split(".");
+  if (parts.length !== 2) return { ok: false, reason: "format" };
+  const [payloadB64, sig] = parts;
+
+  const expected = crypto.createHmac("sha256", SECRET_KEY).update(payloadB64).digest("base64url");
+  if (sig.length !== expected.length) return { ok: false, reason: "siglen" };
+  if (!crypto.timingSafeEqual(Buffer.from(sig), Buffer.from(expected))) return { ok: false, reason: "sig" };
+
+  const payloadJson = Buffer.from(payloadB64, "base64url").toString("utf8");
+  let payload;
+  try {
+    payload = JSON.parse(payloadJson);
+  } catch {
+    return { ok: false, reason: "json" };
+  }
+
+  if (payload.room !== room) return { ok: false, reason: "room" };
+  if (payload.userId !== userId) return { ok: false, reason: "user" };
+  if (typeof payload.ts !== "number") return { ok: false, reason: "ts" };
+  if (Date.now() - payload.ts > maxAgeMs) return { ok: false, reason: "expired" };
+
+  return { ok: true };
+}
+
+function consumeToken(token) {
+  USED_TOKENS.add(token);
+  // メモリ肥大防止：一応適当に掃除
+  if (USED_TOKENS.size > 5000) {
+    USED_TOKENS.clear();
+  }
+}
+
 /* ===== 入室認証（共通） ===== */
 app.post("/auth", (req, res) => {
   res.json({ ok: req.body.password === ENTRY_PASSWORD });
 });
 
-/* ===== ルーム一覧取得 ===== */
+/* ===== ルーム一覧 ===== */
 app.get("/rooms", async (req, res) => {
   try {
     const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${ROOM_DIR}?ref=${GITHUB_BRANCH}`;
     const r = await fetch(url, { headers: GH_HEADERS });
 
-    // フォルダがまだ無い/空の時
     if (r.status === 404) return res.json({ rooms: [] });
     if (!r.ok) return res.status(500).json({ error: "failed to list rooms" });
 
@@ -158,7 +202,6 @@ app.post("/rooms/create", async (req, res) => {
     if (!room || !password) return res.status(400).json({ ok: false, error: "missing" });
     if (!safeRoomName(room)) return res.status(400).json({ ok: false, error: "bad_room_name" });
 
-    // 既存チェック
     const existing = await loadRoomData(room);
     if (existing) return res.json({ ok: false, error: "exists" });
 
@@ -176,17 +219,20 @@ app.post("/rooms/create", async (req, res) => {
   }
 });
 
-/* ===== ルーム参加チェック ===== */
+/* ===== ルーム参加（パス正しければ 使い捨てtoken発行） ===== */
 app.post("/rooms/join", async (req, res) => {
   try {
-    const { room, password } = req.body || {};
-    if (!room || !password) return res.status(400).json({ ok: false, error: "missing" });
+    const { room, password, userId } = req.body || {};
+    if (!room || !password || !userId) return res.status(400).json({ ok: false, error: "missing" });
 
     const loaded = await loadRoomData(room);
     if (!loaded) return res.json({ ok: false, error: "not_found" });
 
     const ok = loaded.data.passHash === hashRoomPassword(password);
-    res.json({ ok });
+    if (!ok) return res.json({ ok: false, error: "wrong_password" });
+
+    const token = makeRoomToken(room, userId);
+    res.json({ ok: true, token });
   } catch (e) {
     console.error("POST /rooms/join error:", e);
     res.status(500).json({ ok: false, error: "server" });
@@ -202,10 +248,22 @@ io.on("connection", async (socket) => {
     io.emit("userList", Object.values(users));
   });
 
-  // ルーム入室（履歴送る）
-  socket.on("joinRoom", async ({ room }) => {
+  socket.on("joinRoom", async ({ room, userId, token }) => {
     try {
       if (!room || !safeRoomName(room)) return;
+      if (!userId || !token) {
+        socket.emit("roomAuthFailed", "missing");
+        return;
+      }
+
+      const v = verifyRoomToken(token, room, userId);
+      if (!v.ok) {
+        socket.emit("roomAuthFailed", v.reason);
+        return;
+      }
+
+      // ★一回使ったら失効（毎回パス必須運用）
+      consumeToken(token);
 
       socket.join(room);
 
@@ -222,10 +280,30 @@ io.on("connection", async (socket) => {
     }
   });
 
-  socket.on("chat message", async ({ room, msg }) => {
+  socket.on("chat message", async ({ room, msg, userId, token }) => {
     try {
       if (!room || !safeRoomName(room)) return;
-      if (!msg || !msg.id) return;
+      if (!msg || !msg.id || !msg.userId) return;
+      if (!userId || !token) {
+        socket.emit("roomAuthFailed", "missing");
+        return;
+      }
+
+      // tokenは joinRoom で消費済みなので、送信ごとに token を要求しない運用も可能。
+      // ただ「毎回パス必須」に寄せるなら、送信も token 必須にしている方が堅い。
+      // ここでは token を毎回要求し、同じtokenは使えないので rooms経由が必要になる。
+      const v = verifyRoomToken(token, room, userId);
+      if (!v.ok) {
+        socket.emit("roomAuthFailed", v.reason);
+        return;
+      }
+      consumeToken(token);
+
+      // userId一致チェック（なりすまし防止）
+      if (msg.userId !== userId) {
+        socket.emit("roomAuthFailed", "user_mismatch");
+        return;
+      }
 
       const loaded = await loadRoomData(room);
       if (!loaded) return;
@@ -243,28 +321,28 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // 削除（サーバーで所有者確認）
-  socket.on("requestDelete", async ({ room, id, userId }) => {
+  socket.on("requestDelete", async ({ room, id, userId, token }) => {
     try {
       if (!room || !safeRoomName(room)) return;
-      if (!id || !userId) return;
+      if (!id || !userId || !token) return socket.emit("deleteFailed", { id, reason: "missing" });
+
+      const v = verifyRoomToken(token, room, userId);
+      if (!v.ok) return socket.emit("deleteFailed", { id, reason: "no_access" });
+      consumeToken(token);
 
       const loaded = await loadRoomData(room);
       if (!loaded) return;
 
       const messages = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
       const target = messages.find(m => m.id === id);
-
       if (!target) return;
 
-      // 所有者判定：userId で行う（名前/アイコン変更に影響されない）
       if (target.userId !== userId) {
         socket.emit("deleteFailed", { id, reason: "not_owner" });
         return;
       }
 
-      const next = messages.filter(m => m.id !== id);
-      loaded.data.messages = next;
+      loaded.data.messages = messages.filter(m => m.id !== id);
       await saveRoomData(room, loaded.data, loaded.sha);
 
       io.to(room).emit("delete message", id);
@@ -274,14 +352,18 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // 管理者：全削除（部屋単位）
-  socket.on("adminClearAll", async ({ room, password }) => {
+  socket.on("adminClearAll", async ({ room, password, userId, token }) => {
     try {
       if (password !== ADMIN_PASSWORD) {
         socket.emit("adminClearFailed", "wrong password");
         return;
       }
       if (!room || !safeRoomName(room)) return;
+      if (!userId || !token) return socket.emit("adminClearFailed", "missing");
+
+      const v = verifyRoomToken(token, room, userId);
+      if (!v.ok) return socket.emit("adminClearFailed", "no access");
+      consumeToken(token);
 
       const loaded = await loadRoomData(room);
       if (!loaded) return;
