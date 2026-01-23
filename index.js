@@ -10,7 +10,9 @@ const io = new Server(server);
 
 /* ===== 設定 ===== */
 const MAX_MESSAGES = 100;
-const ROOM_DIR = "rooms"; // GitHub上の保存先フォルダ（contents API で扱える）
+const ROOM_DIR = "rooms";      // GitHub上の保存先フォルダ（contents API で扱える）
+const UPLOAD_DIR = "uploads";  // 画像保存先
+const IMAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30日
 
 // env
 const {
@@ -25,7 +27,8 @@ const {
 } = process.env;
 
 app.use(express.static("public"));
-app.use(express.json());
+// 画像送信があるのでサイズ上限を増やす
+app.use(express.json({ limit: "8mb" }));
 
 let users = {}; // socket.id -> user
 
@@ -59,7 +62,6 @@ const GH_HEADERS = {
 };
 
 function roomFilePath(room) {
-  // 例: rooms/myroom.env.json
   return `${ROOM_DIR}/${room}.env.json`;
 }
 
@@ -69,8 +71,7 @@ function roomUrl(room) {
 }
 
 async function ghGet(url) {
-  const res = await fetch(url, { headers: GH_HEADERS });
-  return res;
+  return await fetch(url, { headers: GH_HEADERS });
 }
 
 async function ghPut(filePath, contentBase64, sha) {
@@ -81,24 +82,18 @@ async function ghPut(filePath, contentBase64, sha) {
     branch: GITHUB_BRANCH,
     ...(sha ? { sha } : {})
   };
-  const res = await fetch(url, {
+  return await fetch(url, {
     method: "PUT",
     headers: GH_HEADERS,
     body: JSON.stringify(body)
   });
-  return res;
 }
 
 function safeRoomName(name) {
-  // GitHubパスに使うので最低限の制限
-  // 日本語はOKにしたい場合もあるが、まずは英数-_ のみ推奨（安全）
-  // 必要なら緩められる
   return /^[a-zA-Z0-9_-]{1,40}$/.test(name);
 }
 
 function hashRoomPassword(roomPassword) {
-  // SECRET_KEYが漏れない前提で、roomPassword をハッシュ化して保存
-  // ただし本気の強度が欲しいならPBKDF2/bcryptにしたい（後で差し替え可）
   return crypto.createHash("sha256").update(String(roomPassword)).digest("hex");
 }
 
@@ -125,6 +120,21 @@ async function saveRoomData(room, data, sha) {
   }
 }
 
+/* ===== 30日超の画像だけ履歴から削除 ===== */
+function pruneOldImages(messages) {
+  const now = Date.now();
+  const arr = Array.isArray(messages) ? messages : [];
+  return arr.filter(m => {
+    if (m && m.type === "image") {
+      const ts = Number(m.ts || 0);
+      // 互換性：tsが無い古い画像は残す（必要なら false にして一括削除も可能）
+      if (!ts) return true;
+      return (now - ts) <= IMAGE_TTL_MS;
+    }
+    return true;
+  });
+}
+
 /* ===== 入室認証（共通） ===== */
 app.post("/auth", (req, res) => {
   res.json({ ok: req.body.password === ENTRY_PASSWORD });
@@ -136,7 +146,6 @@ app.get("/rooms", async (req, res) => {
     const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${ROOM_DIR}?ref=${GITHUB_BRANCH}`;
     const r = await fetch(url, { headers: GH_HEADERS });
 
-    // フォルダがまだ無い/空の時
     if (r.status === 404) return res.json({ rooms: [] });
     if (!r.ok) return res.status(500).json({ error: "failed to list rooms" });
 
@@ -158,7 +167,6 @@ app.post("/rooms/create", async (req, res) => {
     if (!room || !password) return res.status(400).json({ ok: false, error: "missing" });
     if (!safeRoomName(room)) return res.status(400).json({ ok: false, error: "bad_room_name" });
 
-    // 既存チェック
     const existing = await loadRoomData(room);
     if (existing) return res.json({ ok: false, error: "exists" });
 
@@ -193,6 +201,72 @@ app.post("/rooms/join", async (req, res) => {
   }
 });
 
+/* ===== 画像アップロード（private repoに保存） ===== */
+function uploadFilePath(room, filename) {
+  return `${UPLOAD_DIR}/${room}/${filename}`;
+}
+
+function safeUploadFilename(name) {
+  return /^[a-zA-Z0-9_-]{1,80}\.(jpg|jpeg)$/i.test(name);
+}
+
+app.post("/upload", async (req, res) => {
+  try {
+    const { room, filename, dataBase64 } = req.body || {};
+    if (!room || !safeRoomName(room)) return res.status(400).json({ ok: false, error: "bad_room" });
+    if (!filename || !safeUploadFilename(filename)) return res.status(400).json({ ok: false, error: "bad_filename" });
+    if (!dataBase64 || typeof dataBase64 !== "string") return res.status(400).json({ ok: false, error: "missing" });
+
+    const filePath = uploadFilePath(room, filename);
+
+    // sha取得（既存なら上書き。uuid運用なら基本不要）
+    let sha;
+    const checkUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${GITHUB_BRANCH}`;
+    const check = await ghGet(checkUrl);
+    if (check.ok) {
+      const j = await check.json();
+      sha = j.sha;
+    }
+
+    const putRes = await ghPut(filePath, dataBase64, sha);
+    if (!putRes.ok) {
+      const t = await putRes.text().catch(() => "");
+      console.error("upload ghPut failed:", putRes.status, t);
+      return res.status(500).json({ ok: false, error: "github" });
+    }
+
+    // privateなのでpathを返す
+    res.json({ ok: true, path: filePath });
+  } catch (e) {
+    console.error("POST /upload error:", e);
+    res.status(500).json({ ok: false, error: "server" });
+  }
+});
+
+/* ===== private repo画像取得（サーバ経由で返す） ===== */
+app.get("/image", async (req, res) => {
+  try {
+    const filePath = String(req.query.path || "");
+    if (!filePath) return res.sendStatus(400);
+    if (!filePath.startsWith(`${UPLOAD_DIR}/`)) return res.sendStatus(403);
+
+    const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${GITHUB_BRANCH}`;
+    const ghRes = await ghGet(url);
+    if (!ghRes.ok) return res.sendStatus(404);
+
+    const json = await ghRes.json();
+    const buffer = Buffer.from(json.content, "base64");
+
+    // jpg想定（resizeでjpg固定）
+    res.type("jpeg");
+    res.setHeader("Cache-Control", "public, max-age=86400");
+    res.send(buffer);
+  } catch (e) {
+    console.error("GET /image error:", e);
+    res.sendStatus(500);
+  }
+});
+
 /* ===== socket.io ===== */
 io.on("connection", async (socket) => {
   console.log("connected:", socket.id);
@@ -202,7 +276,7 @@ io.on("connection", async (socket) => {
     io.emit("userList", Object.values(users));
   });
 
-  // ルーム入室（履歴送る）
+  // ルーム入室（履歴送る）＋画像掃除
   socket.on("joinRoom", async ({ room }) => {
     try {
       if (!room || !safeRoomName(room)) return;
@@ -215,7 +289,16 @@ io.on("connection", async (socket) => {
         return;
       }
 
-      socket.emit("history", { room, msgs: loaded.data.messages || [] });
+      const before = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
+      const pruned = pruneOldImages(before);
+
+      // 変化があれば保存し直す（全員に効く）
+      if (pruned.length !== before.length) {
+        loaded.data.messages = pruned;
+        await saveRoomData(room, loaded.data, loaded.sha);
+      }
+
+      socket.emit("history", { room, msgs: pruned });
     } catch (e) {
       console.error("joinRoom error:", e);
       socket.emit("roomError", "join failed");
@@ -232,6 +315,10 @@ io.on("connection", async (socket) => {
 
       let messages = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
       messages.push(msg);
+
+      // 画像だけ30日超を掃除
+      messages = pruneOldImages(messages);
+
       if (messages.length > MAX_MESSAGES) messages = messages.slice(-MAX_MESSAGES);
 
       loaded.data.messages = messages;
@@ -254,10 +341,8 @@ io.on("connection", async (socket) => {
 
       const messages = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
       const target = messages.find(m => m.id === id);
-
       if (!target) return;
 
-      // 所有者判定：userId で行う（名前/アイコン変更に影響されない）
       if (target.userId !== userId) {
         socket.emit("deleteFailed", { id, reason: "not_owner" });
         return;
