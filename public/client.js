@@ -9,6 +9,17 @@ if (!room) {
   location.replace("/rooms.html");
 }
 
+// ===== URL直打ち対策（password突破済みの人のみ） =====
+if (localStorage.getItem("auth") === "ok") {
+  const KEY_SITE_LAST = "chat_site_last_access";
+  const last = Number(localStorage.getItem(KEY_SITE_LAST) || "0");
+  const TEN_MIN = 10 * 60 * 1000;
+
+  if (!last || (Date.now() - last) > TEN_MIN) {
+    location.replace("/rooms.html");
+  }
+}
+
 // DOM
 const setupPanel = document.getElementById("setupPanel");
 const usernameInput = document.getElementById("usernameInput");
@@ -25,6 +36,10 @@ const userListEl = document.getElementById("userList");
 const onlineCountEl = document.getElementById("onlineCount");
 const inputEl = document.getElementById("m");
 const sendBtn = document.getElementById("send");
+
+// ★画像送信UI（index.htmlに追加済み前提）
+const imageInput = document.getElementById("imageInput");
+const imageBtn = document.getElementById("imageBtn");
 
 // localStorage keys
 const KEY_NAME = "chat_username";
@@ -66,7 +81,7 @@ function showSetupIfNeeded() {
 showSetupIfNeeded();
 
 // avatar ファイルを base64
-avatarInput.addEventListener("change", async (e) => {
+avatarInput.addEventListener("change", (e) => {
   const file = e.target.files[0];
   if (!file) return;
   const reader = new FileReader();
@@ -113,19 +128,96 @@ openSettingsBtn.addEventListener("click", () => {
 });
 
 // HTML エスケープ
-function escapeHtml(s){
+function escapeHtml(s) {
   if (!s && s !== 0) return "";
   return String(s)
-    .replaceAll("&","&amp;")
-    .replaceAll("<","&lt;")
-    .replaceAll(">","&gt;")
-    .replaceAll('"',"&quot;")
-    .replaceAll("'","&#039;");
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#039;");
+}
+
+// 日付+時刻フォーマット
+// 今日：HH:MM / それ以外：YYYY/MM/DD HH:MM
+function formatTime(ts) {
+  const n = Number(ts || 0);
+  if (!n) return "";
+
+  const d = new Date(n);
+  const now = new Date();
+
+  const yyyy = d.getFullYear();
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mi = String(d.getMinutes()).padStart(2, "0");
+
+  const isToday =
+    d.getFullYear() === now.getFullYear() &&
+    d.getMonth() === now.getMonth() &&
+    d.getDate() === now.getDate();
+
+  return isToday ? `${hh}:${mi}` : `${yyyy}/${mm}/${dd} ${hh}:${mi}`;
+}
+
+/* ===== 画像：自動リサイズ（最大1280px、JPEG圧縮） ===== */
+function resizeImageToJpegBlob(file, maxSize = 1280, quality = 0.85) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    const reader = new FileReader();
+
+    reader.onload = () => {
+      img.onload = () => {
+        let { width, height } = img;
+
+        if (width > maxSize || height > maxSize) {
+          const scale = Math.min(maxSize / width, maxSize / height);
+          width = Math.round(width * scale);
+          height = Math.round(height * scale);
+        }
+
+        const canvas = document.createElement("canvas");
+        canvas.width = width;
+        canvas.height = height;
+
+        const ctx = canvas.getContext("2d");
+        ctx.drawImage(img, 0, 0, width, height);
+
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) return reject(new Error("toBlob failed"));
+            resolve(blob);
+          },
+          "image/jpeg",
+          quality
+        );
+      };
+      img.onerror = reject;
+      img.src = reader.result;
+    };
+
+    reader.onerror = reject;
+    reader.readAsDataURL(file);
+  });
+}
+
+function blobToBase64(blob) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => {
+      const dataUrl = String(r.result || "");
+      const base64 = dataUrl.split(",")[1] || "";
+      resolve(base64);
+    };
+    r.onerror = reject;
+    r.readAsDataURL(blob);
+  });
 }
 
 // メッセージ要素
 function makeMessageEl(msg) {
-  // msg: { id, userId, name, color, text, avatar }
+  // msg: { id, userId, name, color, text, avatar, type, path, ts }
   const isOwner = (msg.userId === userId);
   const isSelf = isOwner;
 
@@ -151,30 +243,50 @@ function makeMessageEl(msg) {
     `;
   }
 
+  // テキスト/画像の分岐
+  let bubbleHtml = "";
+  if (msg && msg.type === "image" && msg.path) {
+    const src = `/image?path=${encodeURIComponent(msg.path)}`;
+    bubbleHtml = `
+      <div class="bubble image">
+        <img class="chat-image" src="${src}" alt="image">
+      </div>
+    `;
+  } else {
+    bubbleHtml = `<div class="bubble">${escapeHtml(msg.text)}</div>`;
+  }
+
+  const timeStr = formatTime(msg.ts);
+
   li.innerHTML = `
     ${iconHtml}
     <div class="meta">
-      <div class="msg-name" style="color:${msg.color}">${escapeHtml(msg.name)}</div>
-      <div class="bubble">${escapeHtml(msg.text)}</div>
+      <div class="msg-name" style="color:${msg.color}">
+        <span>${escapeHtml(msg.name)}</span>
+        <span style="margin-left:8px; font-size:11px; color:#777; white-space:nowrap;">
+          ${escapeHtml(timeStr)}
+        </span>
+      </div>
+      ${bubbleHtml}
     </div>
     ${toolsHtml}
   `;
 
   if (isOwner) {
     const delBtn = li.querySelector(".delete");
+    const openBtn = li.querySelector(".open-menu");
     if (delBtn) {
       delBtn.addEventListener("click", () => {
         socket.emit("requestDelete", { room, id: msg.id, userId });
       });
+      delBtn.style.display = "none";
     }
-    const openBtn = li.querySelector(".open-menu");
     if (openBtn) {
       openBtn.addEventListener("click", () => {
-        const del = li.querySelector(".delete");
-        if (del) del.style.display = (del.style.display === "inline-block") ? "none" : "inline-block";
+        if (delBtn) {
+          delBtn.style.display = (delBtn.style.display === "inline-block") ? "none" : "inline-block";
+        }
       });
-      const del = li.querySelector(".delete");
-      if (del) del.style.display = "none";
     }
   }
 
@@ -237,7 +349,7 @@ socket.on("deleteFailed", ({ reason }) => {
   else alert("削除に失敗しました");
 });
 
-// 送信
+// 送信（テキスト）
 sendBtn.addEventListener("click", sendMessage);
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) {
@@ -262,11 +374,79 @@ function sendMessage() {
     name: username,
     color: color,
     avatar: avatar || null,
-    text
+    type: "text",
+    text,
+    ts: Date.now()
   };
 
   socket.emit("chat message", { room, msg });
   inputEl.value = "";
+}
+
+/* ===== 画像送信 ===== */
+if (imageBtn && imageInput) {
+  imageBtn.addEventListener("click", () => {
+    imageInput.click();
+  });
+
+  imageInput.addEventListener("change", async () => {
+    const file = imageInput.files && imageInput.files[0];
+    if (!file) return;
+
+    try {
+      if (!username) {
+        alert("先に設定してください（⚙を押してください）");
+        setupPanel.style.display = "flex";
+        return;
+      }
+
+      if (file.size > 15 * 1024 * 1024) {
+        alert("画像が大きすぎます（15MBまで）");
+        return;
+      }
+
+      const blob = await resizeImageToJpegBlob(file, 1280, 0.85);
+      const base64 = await blobToBase64(blob);
+
+      const filename =
+        (crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2))
+        + ".jpg";
+
+      const upRes = await fetch("/upload", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          room,
+          filename,
+          dataBase64: base64
+        })
+      });
+
+      const up = await upRes.json().catch(() => ({}));
+      if (!up.ok || !up.path) {
+        alert("画像アップロードに失敗しました");
+        return;
+      }
+
+      const msg = {
+        id: crypto.randomUUID ? crypto.randomUUID() : String(Date.now()) + Math.random().toString(36).slice(2),
+        userId,
+        name: username,
+        color: color,
+        avatar: avatar || null,
+        type: "image",
+        path: up.path,
+        ts: Date.now()
+      };
+
+      socket.emit("chat message", { room, msg });
+    } catch (e) {
+      console.error("image send error:", e);
+      alert("画像送信に失敗しました");
+    } finally {
+      imageInput.value = "";
+    }
+  });
 }
 
 // 念のためjoin送る
