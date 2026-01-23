@@ -10,15 +10,6 @@ if (!room) {
 }
 
 // ===== URL直打ち対策（password突破済みの人のみ） =====
-if (localStorage.getItem("auth") === "ok") {
-  const KEY_SITE_LAST = "chat_site_last_access";
-  const last = Number(localStorage.getItem(KEY_SITE_LAST) || "0");
-  const TEN_MIN = 10 * 60 * 1000;
-
-  if (!last || (Date.now() - last) > TEN_MIN) {
-    location.replace("/rooms.html");
-  }
-}
 
 // DOM
 const setupPanel = document.getElementById("setupPanel");
