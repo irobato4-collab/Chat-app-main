@@ -17,7 +17,7 @@
 </head>
 
 <body>
-
+<script src="https://adm.shinobi.jp/s/c6fd0cd4de5a7e975a064e9c4608dfe2"></script>
 
 <div id="setupPanel" class="setup-overlay" aria-hidden="false">
   <div class="setup-box">
@@ -54,7 +54,13 @@
 
   <div class="chat-input-area">
     <input id="m" placeholder="メッセージを入力…" autocomplete="off">
+
+    <!-- ★画像送信用（隠し input） -->
+    <input type="file" id="imageInput" accept="image/*" style="display:none">
+
     <button id="send" class="send-btn">送信</button>
+    <!-- ★画像ボタン -->
+    <button id="imageBtn" class="send-btn" type="button" title="画像送信">🖼</button>
 
     <div id="admin-area">
       <button id="adminClearBtn">🗑 管理者：全削除</button>
@@ -63,4 +69,4 @@
 </div>
 
 </body>
-</html>
+      </html>
