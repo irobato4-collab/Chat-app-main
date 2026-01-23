@@ -10,8 +10,8 @@ const io = new Server(server);
 
 /* ===== 設定 ===== */
 const MAX_MESSAGES = 100;
-const ROOM_DIR = "rooms";      // GitHub上の保存先フォルダ（contents API で扱える）
-const UPLOAD_DIR = "uploads";  // 画像保存先
+const ROOM_DIR = "rooms";       // 暗号化roomデータ保存先
+const UPLOAD_DIR = "uploads";   // 画像保存先（同じrepo）
 const IMAGE_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30日
 
 // env
@@ -27,8 +27,7 @@ const {
 } = process.env;
 
 app.use(express.static("public"));
-// 画像送信があるのでサイズ上限を増やす
-app.use(express.json({ limit: "8mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 let users = {}; // socket.id -> user
 
@@ -61,49 +60,71 @@ const GH_HEADERS = {
   "User-Agent": "chat-app"
 };
 
-function roomFilePath(room) {
-  return `${ROOM_DIR}/${room}.env.json`;
+function ghContentUrl(filePath) {
+  return `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${GITHUB_BRANCH}`;
 }
 
-function roomUrl(room) {
-  const file = roomFilePath(room);
-  return `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(file)}?ref=${GITHUB_BRANCH}`;
+async function ghGetJson(url) {
+  const res = await fetch(url, { headers: GH_HEADERS });
+  if (!res.ok) return { ok: false, status: res.status, json: null, text: await res.text().catch(() => "") };
+  const json = await res.json();
+  return { ok: true, status: res.status, json };
 }
 
-async function ghGet(url) {
-  return await fetch(url, { headers: GH_HEADERS });
-}
-
-async function ghPut(filePath, contentBase64, sha) {
+async function ghPut(filePath, contentBase64, sha, message = "update data") {
   const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}`;
   const body = {
-    message: "update room data",
+    message,
     content: contentBase64,
     branch: GITHUB_BRANCH,
     ...(sha ? { sha } : {})
   };
-  return await fetch(url, {
+  const res = await fetch(url, {
     method: "PUT",
     headers: GH_HEADERS,
     body: JSON.stringify(body)
   });
+  return res;
+}
+
+async function ghDelete(filePath, sha, message = "delete file") {
+  const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}`;
+  const body = { message, sha, branch: GITHUB_BRANCH };
+  const res = await fetch(url, {
+    method: "DELETE",
+    headers: GH_HEADERS,
+    body: JSON.stringify(body)
+  });
+  return res;
 }
 
 function safeRoomName(name) {
   return /^[a-zA-Z0-9_-]{1,40}$/.test(name);
 }
 
+function safeUploadFilename(name) {
+  // リサイズ後はjpg固定にする想定
+  return /^[a-zA-Z0-9_-]{1,80}\.jpg$/i.test(name);
+}
+
+function roomFilePath(room) {
+  return `${ROOM_DIR}/${room}.env.json`;
+}
+
 function hashRoomPassword(roomPassword) {
   return crypto.createHash("sha256").update(String(roomPassword)).digest("hex");
 }
 
+/* ===== ルームデータ読み書き（暗号化） ===== */
 async function loadRoomData(room) {
-  const url = roomUrl(room);
-  const res = await ghGet(url);
-  if (res.status === 404) return null;
-  if (!res.ok) throw new Error(`GitHub load failed: ${res.status}`);
+  const filePath = roomFilePath(room);
+  const url = ghContentUrl(filePath);
+  const r = await fetch(url, { headers: GH_HEADERS });
 
-  const json = await res.json();
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(`GitHub load failed: ${r.status}`);
+
+  const json = await r.json();
   const decrypted = decrypt(Buffer.from(json.content, "base64").toString());
   const data = JSON.parse(decrypted);
   return { data, sha: json.sha };
@@ -113,26 +134,56 @@ async function saveRoomData(room, data, sha) {
   const encrypted = encrypt(JSON.stringify(data));
   const content = Buffer.from(encrypted).toString("base64");
   const filePath = roomFilePath(room);
-  const res = await ghPut(filePath, content, sha);
+  const res = await ghPut(filePath, content, sha, "update room data");
   if (!res.ok) {
     const t = await res.text().catch(() => "");
     throw new Error(`GitHub save failed: ${res.status} ${t}`);
   }
 }
 
-/* ===== 30日超の画像だけ履歴から削除 ===== */
-function pruneOldImages(messages) {
+/* ===== 30日超の画像を履歴から削除（画像ファイルも消す用の抽出） ===== */
+function splitOldImages(messages) {
   const now = Date.now();
-  const arr = Array.isArray(messages) ? messages : [];
-  return arr.filter(m => {
+  const keep = [];
+  const remove = [];
+  for (const m of (Array.isArray(messages) ? messages : [])) {
     if (m && m.type === "image") {
       const ts = Number(m.ts || 0);
-      // 互換性：tsが無い古い画像は残す（必要なら false にして一括削除も可能）
-      if (!ts) return true;
-      return (now - ts) <= IMAGE_TTL_MS;
+      if (ts && (now - ts) > IMAGE_TTL_MS) {
+        remove.push(m);
+        continue;
+      }
     }
-    return true;
-  });
+    keep.push(m);
+  }
+  return { keep, remove };
+}
+
+/* ===== 画像ファイルパス ===== */
+function uploadFilePath(room, filename) {
+  return `${UPLOAD_DIR}/${room}/${filename}`;
+}
+
+/* ===== 画像の削除（GitHub上のファイルをDELETE） ===== */
+async function deleteImageFileIfPossible(imagePath) {
+  try {
+    if (!imagePath || typeof imagePath !== "string") return;
+    if (!imagePath.startsWith(`${UPLOAD_DIR}/`)) return;
+
+    // sha を取得
+    const url = ghContentUrl(imagePath);
+    const r = await fetch(url, { headers: GH_HEADERS });
+    if (r.status === 404) return; // もう無い
+    if (!r.ok) return;
+
+    const json = await r.json();
+    const sha = json.sha;
+    if (!sha) return;
+
+    await ghDelete(imagePath, sha, "delete image file");
+  } catch (e) {
+    console.error("deleteImageFileIfPossible error:", e);
+  }
 }
 
 /* ===== 入室認証（共通） ===== */
@@ -170,12 +221,7 @@ app.post("/rooms/create", async (req, res) => {
     const existing = await loadRoomData(room);
     if (existing) return res.json({ ok: false, error: "exists" });
 
-    const data = {
-      room,
-      passHash: hashRoomPassword(password),
-      messages: []
-    };
-
+    const data = { room, passHash: hashRoomPassword(password), messages: [] };
     await saveRoomData(room, data, undefined);
     res.json({ ok: true });
   } catch (e) {
@@ -201,15 +247,7 @@ app.post("/rooms/join", async (req, res) => {
   }
 });
 
-/* ===== 画像アップロード（private repoに保存） ===== */
-function uploadFilePath(room, filename) {
-  return `${UPLOAD_DIR}/${room}/${filename}`;
-}
-
-function safeUploadFilename(name) {
-  return /^[a-zA-Z0-9_-]{1,80}\.(jpg|jpeg)$/i.test(name);
-}
-
+/* ===== 画像アップロード（base64→GitHub PUT） ===== */
 app.post("/upload", async (req, res) => {
   try {
     const { room, filename, dataBase64 } = req.body || {};
@@ -219,23 +257,18 @@ app.post("/upload", async (req, res) => {
 
     const filePath = uploadFilePath(room, filename);
 
-    // sha取得（既存なら上書き。uuid運用なら基本不要）
+    // 既存sha（通常uuidなので無いが安全のため）
     let sha;
-    const checkUrl = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${GITHUB_BRANCH}`;
-    const check = await ghGet(checkUrl);
-    if (check.ok) {
-      const j = await check.json();
-      sha = j.sha;
-    }
+    const meta = await ghGetJson(ghContentUrl(filePath));
+    if (meta.ok && meta.json && meta.json.sha) sha = meta.json.sha;
 
-    const putRes = await ghPut(filePath, dataBase64, sha);
+    const putRes = await ghPut(filePath, dataBase64, sha, "upload image");
     if (!putRes.ok) {
       const t = await putRes.text().catch(() => "");
-      console.error("upload ghPut failed:", putRes.status, t);
+      console.error("upload failed:", putRes.status, t);
       return res.status(500).json({ ok: false, error: "github" });
     }
 
-    // privateなのでpathを返す
     res.json({ ok: true, path: filePath });
   } catch (e) {
     console.error("POST /upload error:", e);
@@ -243,21 +276,17 @@ app.post("/upload", async (req, res) => {
   }
 });
 
-/* ===== private repo画像取得（サーバ経由で返す） ===== */
+/* ===== private repo画像取得（GitHubから取ってそのまま返す） ===== */
 app.get("/image", async (req, res) => {
   try {
     const filePath = String(req.query.path || "");
     if (!filePath) return res.sendStatus(400);
     if (!filePath.startsWith(`${UPLOAD_DIR}/`)) return res.sendStatus(403);
 
-    const url = `https://api.github.com/repos/${GITHUB_OWNER}/${GITHUB_REPO}/contents/${encodeURIComponent(filePath)}?ref=${GITHUB_BRANCH}`;
-    const ghRes = await ghGet(url);
-    if (!ghRes.ok) return res.sendStatus(404);
+    const meta = await ghGetJson(ghContentUrl(filePath));
+    if (!meta.ok || !meta.json) return res.sendStatus(404);
 
-    const json = await ghRes.json();
-    const buffer = Buffer.from(json.content, "base64");
-
-    // jpg想定（resizeでjpg固定）
+    const buffer = Buffer.from(meta.json.content, "base64");
     res.type("jpeg");
     res.setHeader("Cache-Control", "public, max-age=86400");
     res.send(buffer);
@@ -276,7 +305,7 @@ io.on("connection", async (socket) => {
     io.emit("userList", Object.values(users));
   });
 
-  // ルーム入室（履歴送る）＋画像掃除
+  // ルーム入室（履歴送る）＋30日超画像を掃除（履歴＆ファイル）
   socket.on("joinRoom", async ({ room }) => {
     try {
       if (!room || !safeRoomName(room)) return;
@@ -290,21 +319,27 @@ io.on("connection", async (socket) => {
       }
 
       const before = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
-      const pruned = pruneOldImages(before);
+      const { keep, remove } = splitOldImages(before);
 
-      // 変化があれば保存し直す（全員に効く）
-      if (pruned.length !== before.length) {
-        loaded.data.messages = pruned;
+      // 古い画像があれば、履歴更新＋画像ファイル削除
+      if (remove.length) {
+        loaded.data.messages = keep;
         await saveRoomData(room, loaded.data, loaded.sha);
+
+        // 画像ファイルも削除（失敗しても致命ではない）
+        for (const m of remove) {
+          if (m && m.path) await deleteImageFileIfPossible(m.path);
+        }
       }
 
-      socket.emit("history", { room, msgs: pruned });
+      socket.emit("history", { room, msgs: keep });
     } catch (e) {
       console.error("joinRoom error:", e);
       socket.emit("roomError", "join failed");
     }
   });
 
+  // 送信（保存前に30日超画像を掃除）
   socket.on("chat message", async ({ room, msg }) => {
     try {
       if (!room || !safeRoomName(room)) return;
@@ -314,15 +349,24 @@ io.on("connection", async (socket) => {
       if (!loaded) return;
 
       let messages = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
+
+      // tsが無い古い互換を避けるため、無ければサーバで付与
+      if (!msg.ts) msg.ts = Date.now();
+
       messages.push(msg);
 
-      // 画像だけ30日超を掃除
-      messages = pruneOldImages(messages);
+      const { keep, remove } = splitOldImages(messages);
+      messages = keep;
 
       if (messages.length > MAX_MESSAGES) messages = messages.slice(-MAX_MESSAGES);
 
       loaded.data.messages = messages;
       await saveRoomData(room, loaded.data, loaded.sha);
+
+      // 古い画像が出たらファイルも掃除
+      for (const m of remove) {
+        if (m && m.path) await deleteImageFileIfPossible(m.path);
+      }
 
       io.to(room).emit("chat message", msg);
     } catch (e) {
@@ -330,7 +374,7 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // 削除（サーバーで所有者確認）
+  // 削除（画像ならファイルも消す）
   socket.on("requestDelete", async ({ room, id, userId }) => {
     try {
       if (!room || !safeRoomName(room)) return;
@@ -352,6 +396,11 @@ io.on("connection", async (socket) => {
       loaded.data.messages = next;
       await saveRoomData(room, loaded.data, loaded.sha);
 
+      // 画像ならファイルも削除（非同期でもOKだが、ここはawait）
+      if (target.type === "image" && target.path) {
+        await deleteImageFileIfPossible(target.path);
+      }
+
       io.to(room).emit("delete message", id);
     } catch (e) {
       console.error("requestDelete error:", e);
@@ -359,7 +408,7 @@ io.on("connection", async (socket) => {
     }
   });
 
-  // 管理者：全削除（部屋単位）
+  // 管理者：全削除（部屋単位）＋画像ファイルも削除
   socket.on("adminClearAll", async ({ room, password }) => {
     try {
       if (password !== ADMIN_PASSWORD) {
@@ -371,8 +420,17 @@ io.on("connection", async (socket) => {
       const loaded = await loadRoomData(room);
       if (!loaded) return;
 
+      const messages = Array.isArray(loaded.data.messages) ? loaded.data.messages : [];
+
       loaded.data.messages = [];
       await saveRoomData(room, loaded.data, loaded.sha);
+
+      // 画像ファイルも削除
+      for (const m of messages) {
+        if (m && m.type === "image" && m.path) {
+          await deleteImageFileIfPossible(m.path);
+        }
+      }
 
       io.to(room).emit("clearAllMessages");
     } catch (e) {
