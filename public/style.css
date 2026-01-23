@@ -107,3 +107,5 @@ body{
 .room-btn:hover{
   border-color:#00b900;
 }
+.chat-image{ max-width:260px; max-height:260px; border-radius:12px; display:block; }
+.bubble.image{ padding:8px; }
