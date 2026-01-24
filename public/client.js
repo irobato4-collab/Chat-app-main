@@ -1,5 +1,102 @@
 const socket = io();
 
+const encoder = new TextEncoder();
+const decoder = new TextDecoder();
+
+async function deriveKey(password, salt) {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    encoder.encode(password),
+    "PBKDF2",
+    false,
+    ["deriveKey"]
+  );
+
+  return crypto.subtle.deriveKey(
+    {
+      name: "PBKDF2",
+      salt,
+      iterations: 100000,
+      hash: "SHA-256"
+    },
+    keyMaterial,
+    { name: "AES-GCM", length: 256 },
+    false,
+    ["encrypt", "decrypt"]
+  );
+}
+
+async function encryptImage(file, roomPassword) {
+  const resized = await resizeImage(file);
+  const buffer = await resized.arrayBuffer();
+
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(roomPassword, salt);
+
+  const encrypted = await crypto.subtle.encrypt(
+    { name: "AES-GCM", iv },
+    key,
+    buffer
+  );
+
+  return {
+    type: "image",
+    data: btoa(String.fromCharCode(...new Uint8Array(encrypted))),
+    iv: Array.from(iv),
+    salt: Array.from(salt),
+    mime: "image/jpeg",
+    ts: Date.now()
+  };
+}
+
+async function decryptImage(payload, roomPassword) {
+  const key = await deriveKey(
+    roomPassword,
+    new Uint8Array(payload.salt)
+  );
+
+  const decrypted = await crypto.subtle.decrypt(
+    {
+      name: "AES-GCM",
+      iv: new Uint8Array(payload.iv)
+    },
+    key,
+    Uint8Array.from(atob(payload.data), c => c.charCodeAt(0))
+  );
+
+  return URL.createObjectURL(
+    new Blob([decrypted], { type: payload.mime })
+  );
+    }
+
+const imageInput = document.getElementById("imageInput");
+const imageBtn = document.getElementById("imageBtn");
+
+imageBtn.onclick = () => imageInput.click();
+
+imageInput.onchange = async () => {
+  const file = imageInput.files[0];
+  if (!file) return;
+
+  const roomPassword = prompt("画像送信：部屋パスワード");
+  if (!roomPassword) return;
+
+  const encrypted = await encryptImage(file, roomPassword);
+
+  socket.emit("chat message", {
+    room,
+    msg: {
+      id: crypto.randomUUID(),
+      userId,
+      name: username,
+      color,
+      avatar,
+      image: encrypted
+    }
+  });
+};
+
 // room (from query)
 const params = new URLSearchParams(location.search);
 const room = params.get("room");
