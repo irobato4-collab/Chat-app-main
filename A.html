@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>Chat File Encrypt / Decrypt Editor</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+
+<style>
+body{
+  background:#0e0e0e;
+  color:#eee;
+  font-family:monospace;
+  padding:20px;
+}
+h2,h3{margin-top:0}
+input, textarea, button{
+  width:100%;
+  margin-top:10px;
+  padding:10px;
+  background:#1c1c1c;
+  color:#fff;
+  border:1px solid #333;
+  border-radius:6px;
+}
+textarea{
+  font-family:monospace;
+}
+button{
+  cursor:pointer;
+  font-size:16px;
+}
+.btn-green{background:#00b900}
+.btn-blue{background:#007acc}
+.btn-green:hover{background:#00a000}
+.btn-blue:hover{background:#0060a8}
+pre{
+  background:#070707;
+  padding:10px;
+  border-radius:6px;
+  white-space:pre-wrap;
+  word-break:break-all;
+}
+small{color:#aaa}
+hr{margin:20px 0;border:0;border-top:1px solid #333}
+</style>
+</head>
+<body>
+
+<h2>🔐 Chat Encrypted File Editor</h2>
+
+<label>SECRET_KEY</label>
+<input id="key" placeholder="process.env.SECRET_KEY">
+
+<hr>
+
+<label>📁 暗号化ファイルを選択</label>
+<input type="file" id="file">
+
+<label>✍️ または暗号化文字列</label>
+<textarea id="encInput" rows="5" placeholder="base64文字列"></textarea>
+
+<button class="btn-green" onclick="decrypt()">🔓 復号</button>
+
+<hr>
+
+<h3>📝 編集（JSON）</h3>
+<textarea id="jsonEditor" rows="18" placeholder="復号するとここに表示されます"></textarea>
+
+<button class="btn-blue" onclick="encrypt()">🔒 再暗号化 & ダウンロード</button>
+
+<hr>
+
+<h3>📦 再暗号化データ（base64）</h3>
+<pre id="out"></pre>
+
+<script>
+const encInput = document.getElementById("encInput");
+const jsonEditor = document.getElementById("jsonEditor");
+const out = document.getElementById("out");
+
+document.getElementById("file").addEventListener("change", e=>{
+  const f = e.target.files[0];
+  if(!f) return;
+  const r = new FileReader();
+  r.onload = () => encInput.value = r.result.trim();
+  r.readAsText(f);
+});
+
+async function getKey(secret){
+  const hash = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(secret)
+  );
+  return crypto.subtle.importKey(
+    "raw",
+    hash,
+    {name:"AES-GCM"},
+    false,
+    ["encrypt","decrypt"]
+  );
+}
+
+async function decrypt(){
+  try{
+    const secret = key.value.trim();
+    const base64 = encInput.value.trim();
+    if(!secret || !base64) return alert("SECRET_KEY とデータ必須");
+
+    const raw = Uint8Array.from(atob(base64), c=>c.charCodeAt(0));
+    const iv  = raw.slice(0,12);
+    const tag = raw.slice(12,28);
+    const enc = raw.slice(28);
+
+    const keyObj = await getKey(secret);
+
+    const combined = new Uint8Array(enc.length + tag.length);
+    combined.set(enc,0);
+    combined.set(tag,enc.length);
+
+    const dec = await crypto.subtle.decrypt(
+      {name:"AES-GCM", iv, tagLength:128},
+      keyObj,
+      combined
+    );
+
+    const text = new TextDecoder().decode(dec);
+    jsonEditor.value = JSON.stringify(JSON.parse(text), null, 2);
+    out.textContent = "";
+  }catch(e){
+    console.error(e);
+    alert("復号失敗（key or データ不一致）");
+  }
+}
+
+async function encrypt(){
+  try{
+    const secret = key.value.trim();
+    if(!secret) return alert("SECRET_KEY必須");
+
+    let obj;
+    try{
+      obj = JSON.parse(jsonEditor.value);
+    }catch{
+      alert("JSONが壊れています");
+      return;
+    }
+
+    const keyObj = await getKey(secret);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+
+    const enc = await crypto.subtle.encrypt(
+      {name:"AES-GCM", iv},
+      keyObj,
+      new TextEncoder().encode(JSON.stringify(obj))
+    );
+
+    const u8 = new Uint8Array(enc);
+    const tag = u8.slice(u8.length-16);
+    const body = u8.slice(0, u8.length-16);
+
+    const all = new Uint8Array(iv.length + tag.length + body.length);
+    all.set(iv,0);
+    all.set(tag,iv.length);
+    all.set(body,iv.length+tag.length);
+
+    const base64 = btoa(String.fromCharCode(...all));
+    out.textContent = base64;
+
+    // download
+    const blob = new Blob([base64], {type:"text/plain"});
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = "room_encrypted.enc";
+    a.click();
+    URL.revokeObjectURL(a.href);
+
+  }catch(e){
+    console.error(e);
+    alert("暗号化失敗");
+  }
+}
+</script>
+
+</body>
+  </html>
