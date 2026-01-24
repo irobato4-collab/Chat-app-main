@@ -52,7 +52,24 @@ function decrypt(enc) {
   decipher.setAuthTag(tag);
   return Buffer.concat([decipher.update(data), decipher.final()]).toString("utf8");
 }
+/* ===== バイナリ用 暗号化（画像） ===== */
+function encryptBinary(buffer) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv(ALGO, KEY, iv);
+  const encrypted = Buffer.concat([cipher.update(buffer), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, tag, encrypted]).toString("base64");
+}
 
+function decryptBinary(encBase64) {
+  const buf = Buffer.from(encBase64, "base64");
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const data = buf.subarray(28);
+  const decipher = crypto.createDecipheriv(ALGO, KEY, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(data), decipher.final()]);
+}
 /* ===== GitHub API ===== */
 const GH_HEADERS = {
   Authorization: `Bearer ${GITHUB_TOKEN}`,
@@ -262,7 +279,15 @@ app.post("/upload", async (req, res) => {
     const meta = await ghGetJson(ghContentUrl(filePath));
     if (meta.ok && meta.json && meta.json.sha) sha = meta.json.sha;
 
-    const putRes = await ghPut(filePath, dataBase64, sha, "upload image");
+    const rawBuffer = Buffer.from(dataBase64, "base64");
+const encryptedBase64 = encryptBinary(rawBuffer);
+
+const putRes = await ghPut(
+  filePath,
+  Buffer.from(encryptedBase64).toString("base64"),
+  sha,
+  "upload encrypted image"
+);
     if (!putRes.ok) {
       const t = await putRes.text().catch(() => "");
       console.error("upload failed:", putRes.status, t);
@@ -286,10 +311,13 @@ app.get("/image", async (req, res) => {
     const meta = await ghGetJson(ghContentUrl(filePath));
     if (!meta.ok || !meta.json) return res.sendStatus(404);
 
-    const buffer = Buffer.from(meta.json.content, "base64");
-    res.type("jpeg");
-    res.setHeader("Cache-Control", "public, max-age=86400");
-    res.send(buffer);
+    const encryptedBase64 = Buffer.from(meta.json.content, "base64").toString();
+const imageBuffer = decryptBinary(encryptedBase64);
+
+res.type("jpeg");
+res.setHeader("Cache-Control", "public, max-age=86400");
+res.send(imageBuffer);
+    
   } catch (e) {
     console.error("GET /image error:", e);
     res.sendStatus(500);
