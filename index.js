@@ -8,6 +8,11 @@ const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
+// ===== 外部Ping用（スリープ防止）=====
+app.get("/ping", (req, res) => {
+  res.status(200).send("pong");
+});
+
 /* ===== 設定 ===== */
 const MAX_MESSAGES = 100;
 const ROOM_DIR = "rooms";       // 暗号化roomデータ保存先
